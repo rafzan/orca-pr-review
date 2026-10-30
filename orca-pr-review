@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+# Opens an Orca review workspace when a PR requests a review from you.
+# A re-request goes to the workspace that already exists for that PR.
+# Usage: orca-pr-review [--seed | --dry-run | --pr <n> | --interval <seconds> | ...]
+#   (no flag)              check the notifications feed once; launchd runs this
+#   --seed                 record the current review requests as handled, open nothing
+#   --dry-run              print what would happen, write nothing
+#   --pr <n>               check one PR now, without the feed
+#   --interval <s>         install or update the launchd job with this check interval
+#   --ask-interval         ask for the interval in minutes in a dialog
+#   --edit-message         open the review message template
+#   --claude <n> [--continue]  start the review session; Orca runs this in the workspace
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/orca-pr-review"
+MESSAGE="$CONFIG_DIR/message.txt"
+DEFAULT_MESSAGE="Review PR #{pr}. Just review, do not post anything, do not approve or request changes, wait for my input. Be brief, short and sniper-style to draft comments. Create sanity-check steps if needed. If you have nits that are borderline blockers, add to the final report. If you need to expand on a topic, make a list and suggest I should expand on these items."
+
+mkdir -p "$CONFIG_DIR"
+[[ -f "$MESSAGE" ]] || echo "$DEFAULT_MESSAGE" >"$MESSAGE"
+
+message() { sed "s/{pr}/$1/g" "$MESSAGE" | tr '\n' ' ' | sed 's/ *$//'; }
+
+if [[ "${1:-}" == "--ssh-no-push" ]]; then
+  shift
+  if [[ "$*" == *git-receive-pack* ]]; then
+    echo "git push is blocked in PR review sessions" >&2
+    exit 1
+  fi
+  exec ssh "$@"
+fi
+
+# Runs inside the Orca terminal, so it keeps the user's PATH for the session.
+if [[ "${1:-}" == "--claude" ]]; then
+  n="${2:?usage: orca-pr-review --claude <number> [--continue]}"
+  shift 2
+  prompt=$(message "$n")
+  [[ "${1:-}" == "--continue" ]] && prompt="Review re-requested. $prompt"
+  # SSH pushes hit the guard above. HTTPS pushes lose the credential helpers
+  # of the system gitconfig only; install.sh warns about the others.
+  export GIT_SSH_COMMAND="$0 --ssh-no-push" GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0
+  exec claude --dangerously-skip-permissions --settings "$CONFIG_DIR/review-settings.json" ${1+"$@"} "$prompt"
+fi
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+CONFIG="$CONFIG_DIR/config"
+[[ -f "$CONFIG" ]] || { echo "$CONFIG is missing, run install.sh" >&2; exit 1; }
+# Sets GH_REPO (owner/repo) and ORCA_REPO (id:<Orca repo id>).
+source "$CONFIG"
+
+ORCA="/Applications/Orca.app/Contents/Resources/bin/orca"
+SELF="$HOME/.local/bin/orca-pr-review"
+LABEL="local.orca-pr-review"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG="$HOME/Library/Logs/orca-pr-review.log"
+STATE_DIR="$HOME/.local/state/orca-pr-review"
+SEEN="$STATE_DIR/seen"
+LAST_MODIFIED="$STATE_DIR/last-modified"
+LAST_RUN="$STATE_DIR/last-run"
+PLUGIN="orca-pr-review.30s.sh"
+
+mode="${1:-run}"
+pr_arg=""
+mkdir -p "$STATE_DIR"
+touch "$SEEN"
+
+log() { echo "$(date '+%F %T') $*"; }
+status() { [[ "$mode" == "--dry-run" ]] || echo "$(date '+%H:%M') $*" >"$LAST_RUN"; }
+uri() { jq -rn --arg s "$1" '$s | @uri'; }
+
+# Shows a macOS notification through SwiftBar. With a PR number, a click focuses that review.
+notify() {
+  local href=""
+  [[ "$mode" == "--dry-run" || "$mode" == "--seed" ]] && return 0
+  [[ -n "${4:-}" ]] && href="&href=$(uri "swiftbar://refreshplugin?plugin=$PLUGIN&focus_pr=$4")"
+  open -g "swiftbar://notify?plugin=$PLUGIN&title=$(uri "$1")&subtitle=$(uri "$2")&body=$(uri "$3")$href"
+}
+
+# Notifies only when the status changes, so a lasting failure alerts once.
+alert_once() {
+  local prev
+  prev=$(cut -d' ' -f2- "$LAST_RUN" 2>/dev/null || true)
+  status "$1"
+  [[ "$prev" == "$1" ]] || notify "PR review" "$1" "$2"
+}
+trap 'alert_once "error, see the log" "Open the log from the menu bar icon."' ERR
+
+find_worktree() {
+  "$ORCA" worktree list --json | jq -r --arg name "review-pr-$1" '.result.worktrees[] | select(.displayName == $name) | .id' | head -n1
+}
+
+find_claude() {
+  "$ORCA" terminal list --worktree "id:$1" --json |
+    jq -r '.result.terminals[] | select(.agentIdentity == "claude" and .connected) | .handle' | head -n1
+}
+
+case "$mode" in
+  --interval)
+    secs="${2:?usage: orca-pr-review --interval <seconds>}"
+    # GitHub asks notification clients to wait 60 seconds between checks (X-Poll-Interval).
+    if ((secs < 60)); then
+      echo "the minimum is 60 seconds" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$PLIST")"
+    cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key><array><string>$SELF</string></array>
+  <key>StartInterval</key><integer>$secs</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$LOG</string>
+  <key>StandardErrorPath</key><string>$LOG</string>
+</dict>
+</plist>
+EOF
+    domain="gui/$(id -u)"
+    launchctl bootout "$domain/$LABEL" 2>/dev/null || true
+    # bootout returns before the job is gone, and bootstrap fails while it is still there.
+    for _ in $(seq 50); do
+      launchctl print "$domain/$LABEL" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    launchctl bootstrap "$domain" "$PLIST"
+    echo "checking every $secs seconds"
+    exit 0
+    ;;
+  --ask-interval)
+    current=$(plutil -extract StartInterval raw "$PLIST" 2>/dev/null || echo 60)
+    mins=$(osascript -e "text returned of (display dialog \"Check for review requests every how many minutes?\" default answer \"$((current / 60))\" with title \"PR review\")") || exit 0
+    if ! [[ "$mins" =~ ^[0-9]+$ ]] || ((mins < 1)); then
+      osascript -e 'display alert "Enter a whole number of minutes, 1 or more."' >/dev/null
+      exit 1
+    fi
+    exec "$SELF" --interval $((mins * 60))
+    ;;
+  --edit-message)
+    open -t "$MESSAGE"
+    exit 0
+    ;;
+  --focus)
+    n="${2:?usage: orca-pr-review --focus <number>}"
+    wt=$(find_worktree "$n")
+    term=""
+    [[ -n "$wt" ]] && term=$(find_claude "$wt")
+    [[ -n "$term" ]] && { "$ORCA" terminal switch --terminal "$term" --json >/dev/null || true; }
+    open -a Orca
+    exit 0
+    ;;
+  --pr)
+    pr_arg="${2:?usage: orca-pr-review --pr <number>}"
+    mode="run"
+    ;;
+esac
+
+if [[ ! -s "$SEEN" && "$mode" == "run" && -z "$pr_arg" ]]; then
+  mode="--seed"
+fi
+
+me=$(gh api user -q .login)
+new_lm=""
+
+if [[ "$mode" == "run" ]]; then
+  reachable=$("$ORCA" status --json 2>/dev/null | jq -r '.result.runtime.reachable // false' || echo false)
+  if [[ "$reachable" != "true" ]]; then
+    status "Orca is closed, skipped"
+    exit 0
+  fi
+fi
+
+if [[ -n "$pr_arg" ]]; then
+  prs="$pr_arg"
+elif [[ "$mode" == "run" ]]; then
+  # A 304 answer costs no rate limit, so this check is free when nothing changed.
+  lm=$(cat "$LAST_MODIFIED" 2>/dev/null || true)
+  url="repos/$GH_REPO/notifications?all=true&per_page=50"
+  if [[ -n "$lm" ]]; then
+    since=$(jq -rn --arg d "$lm" '$d | strptime("%a, %d %b %Y %H:%M:%S GMT") | mktime - 1 | todate')
+    resp=$(gh api -i -H "If-Modified-Since: $lm" "$url&since=$since" 2>/dev/null || true)
+  else
+    resp=$(gh api -i "$url" 2>/dev/null || true)
+  fi
+  resp=$(tr -d '\r' <<<"$resp")
+  code=$(head -n1 <<<"$resp" | awk '{print $2}')
+  if [[ "$code" == "304" ]]; then
+    status "no new requests"
+    exit 0
+  fi
+  if [[ "$code" != "200" ]]; then
+    status "GitHub answered ${code:-nothing}, skipped"
+    exit 0
+  fi
+  new_lm=$(awk -F': ' 'tolower($1) == "last-modified" { print $2; exit }' <<<"$resp")
+  prs=$(sed '1,/^$/d' <<<"$resp" |
+    jq -r '.[] | select(.subject.type == "PullRequest") | .subject.url | split("/") | last' | sort -u)
+else
+  new_lm=$(gh api -i "repos/$GH_REPO/notifications?all=true&per_page=1" | tr -d '\r' |
+    awk -F': ' 'tolower($1) == "last-modified" { print $2; exit }')
+  prs=$(gh pr list --repo "$GH_REPO" --state open \
+    --search "user-review-requested:@me -author:@me draft:false" \
+    --json number -q '.[].number')
+fi
+
+open_or_resume() {
+  local n="$1" name="review-pr-$1" wt term title
+  title="#$n $(jq -r .title <<<"$pr")"
+  wt=$(find_worktree "$n")
+
+  if [[ -z "$wt" ]]; then
+    wt=$("$ORCA" worktree create --repo "$ORCA_REPO" --name "$name" --no-parent --setup skip \
+      --comment "Review of https://github.com/$GH_REPO/pull/$n" --json | jq -r '.result.worktree.id // .worktree.id')
+    "$ORCA" terminal create --worktree "id:$wt" --title "review" --command "$SELF --claude $n" --json >/dev/null
+    log "opened $name"
+    notify "PR review opened" "$title" "Author: $(jq -r .author.login <<<"$pr")" "$n"
+    return
+  fi
+
+  term=$(find_claude "$wt")
+  if [[ -n "$term" ]]; then
+    "$ORCA" terminal send --terminal "$term" --text "Review re-requested. $(message "$n")" --enter --json >/dev/null
+    log "sent the re-request to the live session in $name"
+    notify "Review re-requested" "$title" "Sent to the open review session." "$n"
+  else
+    "$ORCA" terminal create --worktree "id:$wt" --title "review" --command "$SELF --claude $n --continue" --json >/dev/null
+    log "resumed the last session in $name"
+    notify "Review re-requested" "$title" "Resumed the last review session." "$n"
+  fi
+}
+
+handled=""
+for n in $prs; do
+  pr=$(gh pr view "$n" --repo "$GH_REPO" --json state,isDraft,author,reviewRequests,title)
+  if ! jq -e --arg me "$me" '.state == "OPEN" and (.isDraft | not) and .author.login != $me
+    and any(.reviewRequests[]; .login == $me)' <<<"$pr" >/dev/null; then
+    [[ -n "$pr_arg" ]] && log "PR $n does not request a review from you"
+    continue
+  fi
+
+  # Every request, first or repeated, adds one timeline event with its own id.
+  # GitHub requests code owners automatically, so a request also covers code ownership.
+  last=$(gh api "repos/$GH_REPO/issues/$n/timeline?per_page=100" --paginate \
+    -q ".[] | select(.event == \"review_requested\" and .requested_reviewer.login == \"$me\") | \"\(.id) \(.actor.login)\"" | tail -n1)
+  [[ -z "$last" ]] && continue
+  key="$n:${last%% *}"
+  requester="${last#* }"
+  if grep -qxF "$key" "$SEEN"; then
+    [[ -n "$pr_arg" ]] && log "PR $n is already handled ($key)"
+    continue
+  fi
+
+  author=$(jq -r .author.login <<<"$pr")
+  if grep -q "^$n:" "$SEEN" && [[ "$requester" != "$author" ]]; then
+    log "PR $n: $requester re-requested your review, not the author $author, skipped"
+    [[ "$mode" == "--dry-run" ]] || echo "$key" >>"$SEEN"
+    continue
+  fi
+
+  case "$mode" in
+    --seed) log "seeded $key" ;;
+    --dry-run) log "would open or resume review-pr-$n (key $key)"; continue ;;
+    *) open_or_resume "$n" ;;
+  esac
+  echo "$key" >>"$SEEN"
+  handled="$handled #$n"
+done
+
+if [[ "$mode" != "--dry-run" && -n "$new_lm" ]]; then
+  echo "$new_lm" >"$LAST_MODIFIED"
+fi
+
+if [[ "$mode" == "--seed" ]]; then
+  status "seeded${handled:- nothing}"
+elif [[ -n "$handled" ]]; then
+  status "handled$handled"
+else
+  status "no new requests"
+fi
